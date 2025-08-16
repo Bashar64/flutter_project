@@ -52,7 +52,7 @@ class DefaultFirebaseOptions {
 
   static const FirebaseOptions android = FirebaseOptions(
     apiKey: 'AIzaSyBHzNFFD4WI5hTEjIqV_DBdd8an1KDAbpU',
-    appId: '1:737208879758:android:your-android-app-id',
+    appId: '1:737208879758:android:da959d31e37c9b48c957df',
     messagingSenderId: '737208879758',
     projectId: 'mobile-app-project-43d39',
     storageBucket: 'mobile-app-project-43d39.firebasestorage.app',
@@ -60,7 +60,7 @@ class DefaultFirebaseOptions {
 
   static const FirebaseOptions ios = FirebaseOptions(
     apiKey: 'AIzaSyBHzNFFD4WI5hTEjIqV_DBdd8an1KDAbpU',
-    appId: '1:737208879758:ios:your-ios-app-id',
+    appId: '1:737208879758:ios:da959d31e37c9b48c957df',
     messagingSenderId: '737208879758',
     projectId: 'mobile-app-project-43d39',
     storageBucket: 'mobile-app-project-43d39.firebasestorage.app',
@@ -69,7 +69,7 @@ class DefaultFirebaseOptions {
 
   static const FirebaseOptions macos = FirebaseOptions(
     apiKey: 'AIzaSyBHzNFFD4WI5hTEjIqV_DBdd8an1KDAbpU',
-    appId: '1:737208879758:ios:your-ios-app-id',
+    appId: '1:737208879758:ios:da959d31e37c9b48c957df',
     messagingSenderId: '737208879758',
     projectId: 'mobile-app-project-43d39',
     storageBucket: 'mobile-app-project-43d39.firebasestorage.app',
