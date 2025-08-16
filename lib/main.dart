@@ -1,10 +1,16 @@
 import 'package:flutter/material.dart';
-import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:table_calendar/table_calendar.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 import 'package:uuid/uuid.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'firebase_options.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   runApp(const TaskApp());
 }
 
@@ -30,38 +36,121 @@ class TaskApp extends StatelessWidget {
           LoginScreen.route: (_) => const LoginScreen(),
           SignUpScreen.route: (_) => const SignUpScreen(),
           TaskEditorScreen.route: (_) => const TaskEditorScreen(),
-          MapPickerScreen.route: (_) => const MapPickerScreen(),
+          CalendarScreen.route: (_) => const CalendarScreen(),
+          ProfileScreen.route: (_) => const ProfileScreen(),
         },
       ),
     );
   }
 }
 
-// Simple in-memory auth placeholder (front-end only; integrate Firebase later)
+// Firebase Auth integration
 class AuthState extends ChangeNotifier {
-  bool _isAuthenticated = false;
-  String? _email;
+  final FirebaseAuth _auth = FirebaseAuth.instance;
+  User? _user;
 
-  bool get isAuthenticated => _isAuthenticated;
-  String? get email => _email;
+  User? get user => _user;
+  bool get isAuthenticated => _user != null;
+  String? get email => _user?.email;
+  String? get username => _user?.displayName;
 
-  Future<void> login(String email, String password) async {
-    // Placeholder validation
-    if (email.isNotEmpty && password.length >= 6) {
-      _email = email;
-      _isAuthenticated = true;
+  AuthState() {
+    _auth.authStateChanges().listen((User? user) {
+      _user = user;
       notifyListeners();
+    });
+  }
+
+  Future<String?> login(String email, String password) async {
+    try {
+      await _auth.signInWithEmailAndPassword(email: email, password: password);
+      return null; // Success
+    } on FirebaseAuthException catch (e) {
+      return e.message ?? 'Login failed';
     }
   }
 
-  Future<void> signUp(String email, String password) async {
-    await login(email, password);
+  Future<String?> signUp(String email, String password, String username) async {
+    try {
+      final credential = await _auth.createUserWithEmailAndPassword(
+        email: email,
+        password: password,
+      );
+
+      // Update the user's display name with the username
+      await credential.user?.updateDisplayName(username);
+      await credential.user?.reload();
+      _user = _auth.currentUser; // Refresh the user data
+      notifyListeners();
+
+      return null; // Success
+    } on FirebaseAuthException catch (e) {
+      return e.message ?? 'Sign up failed';
+    }
   }
 
-  void logout() {
-    _isAuthenticated = false;
-    _email = null;
-    notifyListeners();
+  Future<String?> updateUsername(String newUsername) async {
+    try {
+      final user = _auth.currentUser;
+      if (user == null) return 'No user logged in';
+
+      print('Updating username to: $newUsername'); // Debug log
+      await user.updateDisplayName(newUsername);
+      print('Display name updated'); // Debug log
+      await user.reload();
+      print('User reloaded'); // Debug log
+      _user = _auth.currentUser; // Refresh the user data
+      print('User data refreshed: ${_user?.displayName}'); // Debug log
+      notifyListeners();
+
+      return null; // Success
+    } on FirebaseAuthException catch (e) {
+      print('FirebaseAuthException: ${e.code} - ${e.message}'); // Debug log
+      return e.message ?? 'Failed to update username';
+    } catch (e) {
+      print('General error: $e'); // Debug log
+      return 'An error occurred while updating username: $e';
+    }
+  }
+
+  Future<String?> deleteAccount() async {
+    try {
+      final user = _auth.currentUser;
+      if (user == null) return 'No user logged in';
+
+      // Delete user's tasks from Firestore first
+      final firestore = FirebaseFirestore.instance;
+      final tasksCollection = firestore
+          .collection('users')
+          .doc(user.uid)
+          .collection('tasks');
+
+      final tasksDocs = await tasksCollection.get();
+      for (var doc in tasksDocs.docs) {
+        await doc.reference.delete();
+      }
+
+      // Delete the user document
+      await firestore.collection('users').doc(user.uid).delete();
+
+      // Delete the Firebase Auth user account
+      await user.delete();
+
+      _user = null;
+      notifyListeners();
+      return null; // Success
+    } on FirebaseAuthException catch (e) {
+      if (e.code == 'requires-recent-login') {
+        return 'Please log in again before deleting your account for security reasons.';
+      }
+      return e.message ?? 'Failed to delete account';
+    } catch (e) {
+      return 'An error occurred while deleting your account';
+    }
+  }
+
+  Future<void> logout() async {
+    await _auth.signOut();
   }
 }
 
@@ -88,38 +177,155 @@ class TaskItem {
     required this.name,
     required this.dateTime,
     this.description,
-    this.locationLabel,
-    this.latitude,
-    this.longitude,
+    this.isCompleted = false,
   });
 
   final String id;
   final String name;
   final DateTime dateTime;
   final String? description;
-  final String? locationLabel; // Optional label
-  final double? latitude; // Optional lat
-  final double? longitude; // Optional lng
+  final bool isCompleted;
+
+  TaskItem copyWith({
+    String? id,
+    String? name,
+    DateTime? dateTime,
+    String? description,
+    bool? isCompleted,
+  }) {
+    return TaskItem(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      dateTime: dateTime ?? this.dateTime,
+      description: description ?? this.description,
+      isCompleted: isCompleted ?? this.isCompleted,
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'id': id,
+      'name': name,
+      'dateTime': dateTime.millisecondsSinceEpoch,
+      'description': description,
+      'isCompleted': isCompleted,
+    };
+  }
+
+  factory TaskItem.fromMap(Map<String, dynamic> map) {
+    return TaskItem(
+      id: map['id'],
+      name: map['name'],
+      dateTime: DateTime.fromMillisecondsSinceEpoch(map['dateTime']),
+      description: map['description'],
+      isCompleted: map['isCompleted'] ?? false,
+    );
+  }
 }
 
 class TaskState extends ChangeNotifier {
-  final List<TaskItem> _tasks = <TaskItem>[];
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final FirebaseAuth _auth = FirebaseAuth.instance;
+  List<TaskItem> _tasks = [];
 
   List<TaskItem> get tasks => List.unmodifiable(_tasks);
 
-  void addOrUpdate(TaskItem task) {
-    final index = _tasks.indexWhere((t) => t.id == task.id);
-    if (index == -1) {
-      _tasks.add(task);
-    } else {
-      _tasks[index] = task;
-    }
-    notifyListeners();
+  String? get _userId => _auth.currentUser?.uid;
+
+  TaskState() {
+    _auth.authStateChanges().listen((user) {
+      if (user != null) {
+        _loadTasks();
+      } else {
+        _tasks = [];
+        notifyListeners();
+      }
+    });
   }
 
-  void delete(String id) {
-    _tasks.removeWhere((t) => t.id == id);
-    notifyListeners();
+  Future<void> _loadTasks() async {
+    if (_userId == null) return;
+
+    try {
+      final snapshot =
+          await _firestore
+              .collection('users')
+              .doc(_userId)
+              .collection('tasks')
+              .get();
+
+      _tasks =
+          snapshot.docs.map((doc) => TaskItem.fromMap(doc.data())).toList();
+
+      notifyListeners();
+    } catch (e) {
+      // Error loading tasks: $e
+    }
+  }
+
+  Future<void> addOrUpdate(TaskItem task) async {
+    if (_userId == null) return;
+
+    try {
+      await _firestore
+          .collection('users')
+          .doc(_userId)
+          .collection('tasks')
+          .doc(task.id)
+          .set(task.toMap());
+
+      final index = _tasks.indexWhere((t) => t.id == task.id);
+      if (index == -1) {
+        _tasks.add(task);
+      } else {
+        _tasks[index] = task;
+      }
+      notifyListeners();
+    } catch (e) {
+      // Error saving task: $e
+    }
+  }
+
+  Future<void> toggleTaskCompletion(String id) async {
+    if (_userId == null) return;
+
+    try {
+      final taskIndex = _tasks.indexWhere((t) => t.id == id);
+      if (taskIndex == -1) return;
+
+      final task = _tasks[taskIndex];
+      final updatedTask = task.copyWith(isCompleted: !task.isCompleted);
+
+      await _firestore
+          .collection('users')
+          .doc(_userId)
+          .collection('tasks')
+          .doc(id)
+          .update({'isCompleted': updatedTask.isCompleted});
+
+      _tasks[taskIndex] = updatedTask;
+      notifyListeners();
+    } catch (e) {
+      // Error toggling task completion: $e
+    }
+  }
+
+  Future<void> delete(String id) async {
+    if (_userId == null) return;
+
+    try {
+      await _firestore
+          .collection('users')
+          .doc(_userId)
+          .collection('tasks')
+          .doc(id)
+          .delete();
+
+      _tasks.removeWhere((t) => t.id == id);
+      notifyListeners();
+    } catch (e) {
+      // Error deleting task: $e
+    }
   }
 }
 
@@ -145,10 +351,15 @@ class _LoginScreenState extends State<LoginScreen> {
 
   void _submit() async {
     if (_formKey.currentState!.validate()) {
-      await context.read<AuthState>().login(
+      final error = await context.read<AuthState>().login(
         _emailCtrl.text.trim(),
         _passwordCtrl.text,
       );
+      if (error != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error), backgroundColor: Colors.red),
+        );
+      }
     }
   }
 
@@ -213,11 +424,13 @@ class SignUpScreen extends StatefulWidget {
 
 class _SignUpScreenState extends State<SignUpScreen> {
   final _formKey = GlobalKey<FormState>();
+  final _usernameCtrl = TextEditingController();
   final _emailCtrl = TextEditingController();
   final _passwordCtrl = TextEditingController();
 
   @override
   void dispose() {
+    _usernameCtrl.dispose();
     _emailCtrl.dispose();
     _passwordCtrl.dispose();
     super.dispose();
@@ -225,11 +438,18 @@ class _SignUpScreenState extends State<SignUpScreen> {
 
   void _submit() async {
     if (_formKey.currentState!.validate()) {
-      await context.read<AuthState>().signUp(
+      final error = await context.read<AuthState>().signUp(
         _emailCtrl.text.trim(),
         _passwordCtrl.text,
+        _usernameCtrl.text.trim(),
       );
-      if (mounted) Navigator.pop(context);
+      if (error != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error), backgroundColor: Colors.red),
+        );
+      } else if (mounted) {
+        Navigator.pop(context);
+      }
     }
   }
 
@@ -245,6 +465,16 @@ class _SignUpScreenState extends State<SignUpScreen> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
+                TextFormField(
+                  controller: _usernameCtrl,
+                  decoration: const InputDecoration(labelText: 'Username'),
+                  validator:
+                      (v) =>
+                          v != null && v.trim().length >= 3
+                              ? null
+                              : 'Username must be at least 3 characters',
+                ),
+                const SizedBox(height: 12),
                 TextFormField(
                   controller: _emailCtrl,
                   keyboardType: TextInputType.emailAddress,
@@ -287,94 +517,210 @@ class TaskHomeScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('My Tasks'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.logout),
-            onPressed: () => context.read<AuthState>().logout(),
-          ),
-        ],
-      ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => Navigator.pushNamed(context, TaskEditorScreen.route),
-        icon: const Icon(Icons.add),
-        label: const Text('Add'),
-      ),
-      body: Consumer<TaskState>(
-        builder: (context, state, _) {
-          if (state.tasks.isEmpty) {
-            return const Center(child: Text('No tasks yet. Tap + to add.'));
-          }
-          return ListView.separated(
-            padding: const EdgeInsets.all(12),
-            itemCount: state.tasks.length,
-            separatorBuilder: (_, __) => const SizedBox(height: 8),
-            itemBuilder: (context, index) {
-              final t = state.tasks[index];
-              final dateStr = DateFormat(
-                'EEE, MMM d • h:mm a',
-              ).format(t.dateTime);
-              return Dismissible(
-                key: ValueKey(t.id),
-                background: Container(
-                  color: Colors.red,
-                  alignment: Alignment.centerRight,
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  child: const Icon(Icons.delete, color: Colors.white),
-                ),
-                direction: DismissDirection.endToStart,
-                confirmDismiss: (_) async {
-                  return await showDialog<bool>(
-                        context: context,
-                        builder:
-                            (_) => AlertDialog(
-                              title: const Text('Delete task?'),
-                              content: Text(
-                                'Are you sure you want to delete "${t.name}"?',
-                              ),
-                              actions: [
-                                TextButton(
-                                  onPressed:
-                                      () => Navigator.pop(context, false),
-                                  child: const Text('Cancel'),
-                                ),
-                                FilledButton(
-                                  onPressed: () => Navigator.pop(context, true),
-                                  child: const Text('Delete'),
-                                ),
-                              ],
-                            ),
-                      ) ??
-                      false;
-                },
-                onDismissed: (_) => context.read<TaskState>().delete(t.id),
-                child: ListTile(
-                  onTap:
-                      () => Navigator.pushNamed(
-                        context,
-                        TaskEditorScreen.route,
-                        arguments: t,
-                      ),
-                  title: Text(t.name),
-                  subtitle: Text(
-                    [
-                      dateStr,
-                      if (t.description != null &&
-                          t.description!.trim().isNotEmpty)
-                        t.description!,
-                      if (t.locationLabel != null) '📍 ${t.locationLabel}',
-                    ].join('\n'),
+    return Consumer<AuthState>(
+      builder: (context, auth, _) {
+        return Scaffold(
+          appBar: AppBar(
+            title: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('My Tasks'),
+                if (auth.username != null)
+                  Text(
+                    'Welcome, ${auth.username}!',
+                    style: Theme.of(context).textTheme.bodySmall,
                   ),
-                  isThreeLine: true,
-                  trailing: const Icon(Icons.chevron_right),
-                ),
+              ],
+            ),
+            actions: [
+              IconButton(
+                icon: const Icon(Icons.calendar_month),
+                onPressed:
+                    () => Navigator.pushNamed(context, CalendarScreen.route),
+              ),
+              IconButton(
+                icon: const Icon(Icons.person),
+                onPressed:
+                    () => Navigator.pushNamed(context, ProfileScreen.route),
+              ),
+              IconButton(
+                icon: const Icon(Icons.logout),
+                onPressed: () => context.read<AuthState>().logout(),
+              ),
+            ],
+          ),
+          floatingActionButton: FloatingActionButton.extended(
+            onPressed:
+                () => Navigator.pushNamed(context, TaskEditorScreen.route),
+            icon: const Icon(Icons.add),
+            label: const Text('Add'),
+          ),
+          body: Consumer<TaskState>(
+            builder: (context, state, _) {
+              if (state.tasks.isEmpty) {
+                return const Center(child: Text('No tasks yet. Tap + to add.'));
+              }
+              return ListView.separated(
+                padding: const EdgeInsets.all(12),
+                itemCount: state.tasks.length,
+                separatorBuilder: (_, __) => const SizedBox(height: 8),
+                itemBuilder: (context, index) {
+                  final t = state.tasks[index];
+                  final dateStr = DateFormat(
+                    'EEE, MMM d • h:mm a',
+                  ).format(t.dateTime);
+                  return Dismissible(
+                    key: ValueKey(t.id),
+                    background: Container(
+                      color: Colors.red,
+                      alignment: Alignment.centerRight,
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: const Icon(Icons.delete, color: Colors.white),
+                    ),
+                    direction: DismissDirection.endToStart,
+                    confirmDismiss: (_) async {
+                      return await showDialog<bool>(
+                            context: context,
+                            builder:
+                                (_) => AlertDialog(
+                                  title: const Text('Delete task?'),
+                                  content: Text(
+                                    'Are you sure you want to delete "${t.name}"?',
+                                  ),
+                                  actions: [
+                                    TextButton(
+                                      onPressed:
+                                          () => Navigator.pop(context, false),
+                                      child: const Text('Cancel'),
+                                    ),
+                                    FilledButton(
+                                      onPressed:
+                                          () => Navigator.pop(context, true),
+                                      child: const Text('Delete'),
+                                    ),
+                                  ],
+                                ),
+                          ) ??
+                          false;
+                    },
+                    onDismissed: (_) {
+                      context.read<TaskState>().delete(t.id);
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text('Deleted "${t.name}"'),
+                          backgroundColor: Colors.red,
+                          duration: const Duration(seconds: 2),
+                        ),
+                      );
+                    },
+                    child: Card(
+                      margin: const EdgeInsets.symmetric(vertical: 4),
+                      child: ListTile(
+                        onTap:
+                            () => Navigator.pushNamed(
+                              context,
+                              TaskEditorScreen.route,
+                              arguments: t,
+                            ),
+                        leading: Checkbox(
+                          value: t.isCompleted,
+                          onChanged: (bool? value) {
+                            final willComplete = !t.isCompleted;
+                            context.read<TaskState>().toggleTaskCompletion(
+                              t.id,
+                            );
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  willComplete
+                                      ? 'Marked "${t.name}" as completed'
+                                      : 'Marked "${t.name}" as incomplete',
+                                ),
+                                backgroundColor:
+                                    willComplete ? Colors.green : Colors.orange,
+                                duration: const Duration(seconds: 2),
+                              ),
+                            );
+                          },
+                        ),
+                        title: Text(
+                          t.name,
+                          style: TextStyle(
+                            decoration:
+                                t.isCompleted
+                                    ? TextDecoration.lineThrough
+                                    : TextDecoration.none,
+                            color: t.isCompleted ? Colors.grey : null,
+                          ),
+                        ),
+                        subtitle: Text(
+                          [
+                            dateStr,
+                            if (t.description != null &&
+                                t.description!.trim().isNotEmpty)
+                              t.description!,
+                          ].join('\n'),
+                          style: TextStyle(
+                            color: t.isCompleted ? Colors.grey : null,
+                          ),
+                        ),
+                        isThreeLine: true,
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            IconButton(
+                              icon: const Icon(Icons.delete, color: Colors.red),
+                              onPressed: () async {
+                                final confirm = await showDialog<bool>(
+                                  context: context,
+                                  builder:
+                                      (context) => AlertDialog(
+                                        title: const Text('Delete Task'),
+                                        content: Text('Delete "${t.name}"?'),
+                                        actions: [
+                                          TextButton(
+                                            onPressed:
+                                                () => Navigator.pop(
+                                                  context,
+                                                  false,
+                                                ),
+                                            child: const Text('Cancel'),
+                                          ),
+                                          FilledButton(
+                                            onPressed:
+                                                () => Navigator.pop(
+                                                  context,
+                                                  true,
+                                                ),
+                                            child: const Text('Delete'),
+                                          ),
+                                        ],
+                                      ),
+                                );
+                                if (confirm == true) {
+                                  context.read<TaskState>().delete(t.id);
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text('Deleted "${t.name}"'),
+                                      backgroundColor: Colors.red,
+                                      duration: const Duration(seconds: 2),
+                                    ),
+                                  );
+                                }
+                              },
+                            ),
+                            const Icon(Icons.chevron_right),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                },
               );
             },
-          );
-        },
-      ),
+          ),
+        );
+      },
     );
   }
 }
@@ -392,9 +738,7 @@ class _TaskEditorScreenState extends State<TaskEditorScreen> {
   final _nameCtrl = TextEditingController();
   final _descCtrl = TextEditingController();
   DateTime? _dateTime;
-  String? _locationLabel;
-  double? _lat;
-  double? _lng;
+  bool _isCompleted = false;
   late String _id;
 
   @override
@@ -412,7 +756,7 @@ class _TaskEditorScreenState extends State<TaskEditorScreen> {
       _nameCtrl.text = existing.name;
       _descCtrl.text = existing.description ?? '';
       _dateTime = existing.dateTime;
-      _locationLabel = existing.locationLabel;
+      _isCompleted = existing.isCompleted;
     }
   }
 
@@ -457,12 +801,10 @@ class _TaskEditorScreenState extends State<TaskEditorScreen> {
         dateTime: _dateTime ?? DateTime.now(),
         description:
             _descCtrl.text.trim().isEmpty ? null : _descCtrl.text.trim(),
-        locationLabel: _locationLabel,
-        latitude: _lat,
-        longitude: _lng,
+        isCompleted: _isCompleted,
       );
       context.read<TaskState>().addOrUpdate(task);
-      Navigator.pop(context);
+      if (mounted) Navigator.pop(context);
     }
   }
 
@@ -510,31 +852,15 @@ class _TaskEditorScreenState extends State<TaskEditorScreen> {
                 label: Text(dateLabel),
               ),
               const SizedBox(height: 12),
-              OutlinedButton.icon(
-                onPressed: () async {
-                  final result = await Navigator.pushNamed(
-                    context,
-                    MapPickerScreen.route,
-                    arguments: MapPickerInput(
-                      initialLatitude: _lat,
-                      initialLongitude: _lng,
-                      initialLabel: _locationLabel,
-                    ),
-                  );
-                  if (result is MapPickerResult) {
-                    setState(() {
-                      _locationLabel = result.label;
-                      _lat = result.latitude;
-                      _lng = result.longitude;
-                    });
-                  }
+              CheckboxListTile(
+                title: const Text('Mark as completed'),
+                value: _isCompleted,
+                onChanged: (bool? value) {
+                  setState(() {
+                    _isCompleted = value ?? false;
+                  });
                 },
-                icon: const Icon(Icons.place_outlined),
-                label: Text(
-                  _locationLabel == null
-                      ? 'Add location (Google Maps)'
-                      : 'Location: $_locationLabel',
-                ),
+                controlAffinity: ListTileControlAffinity.leading,
               ),
               const SizedBox(height: 20),
               FilledButton.icon(
@@ -550,116 +876,522 @@ class _TaskEditorScreenState extends State<TaskEditorScreen> {
   }
 }
 
-// Map picker input/result models
-class MapPickerInput {
-  const MapPickerInput({
-    this.initialLatitude,
-    this.initialLongitude,
-    this.initialLabel,
-  });
-  final double? initialLatitude;
-  final double? initialLongitude;
-  final String? initialLabel;
-}
-
-class MapPickerResult {
-  const MapPickerResult({
-    required this.latitude,
-    required this.longitude,
-    this.label,
-  });
-  final double latitude;
-  final double longitude;
-  final String? label;
-}
-
-// Basic Google Maps picker screen
-class MapPickerScreen extends StatefulWidget {
-  const MapPickerScreen({super.key});
-  static const route = '/map-picker';
+// Calendar screen with task management
+class CalendarScreen extends StatefulWidget {
+  const CalendarScreen({super.key});
+  static const route = '/calendar';
 
   @override
-  State<MapPickerScreen> createState() => _MapPickerScreenState();
+  State<CalendarScreen> createState() => _CalendarScreenState();
 }
 
-class _MapPickerScreenState extends State<MapPickerScreen> {
-  GoogleMapController? _controller;
-  LatLng? _selected;
-  final TextEditingController _labelCtrl = TextEditingController();
-
-  @override
-  void dispose() {
-    _controller?.dispose();
-    _labelCtrl.dispose();
-    super.dispose();
-  }
+class _CalendarScreenState extends State<CalendarScreen> {
+  DateTime _focusedDay = DateTime.now();
+  DateTime? _selectedDay;
+  CalendarFormat _calendarFormat = CalendarFormat.month;
 
   @override
   Widget build(BuildContext context) {
-    final args = ModalRoute.of(context)?.settings.arguments;
-    LatLng initial = const LatLng(25.276987, 55.296249); // Default: Dubai
-    if (args is MapPickerInput) {
-      if (args.initialLatitude != null && args.initialLongitude != null) {
-        initial = LatLng(args.initialLatitude!, args.initialLongitude!);
-        _selected ??= initial;
-      }
-      if (_labelCtrl.text.isEmpty && args.initialLabel != null) {
-        _labelCtrl.text = args.initialLabel!;
-      }
+    return Consumer<AuthState>(
+      builder: (context, auth, _) {
+        return Scaffold(
+          appBar: AppBar(
+            title: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Task Calendar'),
+                if (auth.username != null)
+                  Text(
+                    'Welcome, ${auth.username}!',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+              ],
+            ),
+            actions: [
+              IconButton(
+                icon: const Icon(Icons.add),
+                onPressed:
+                    () => Navigator.pushNamed(context, TaskEditorScreen.route),
+              ),
+            ],
+          ),
+          body: Consumer<TaskState>(
+            builder: (context, taskState, _) {
+              return Column(
+                children: [
+                  TableCalendar<TaskItem>(
+                    firstDay: DateTime.utc(2020, 1, 1),
+                    lastDay: DateTime.utc(2030, 12, 31),
+                    focusedDay: _focusedDay,
+                    calendarFormat: _calendarFormat,
+                    eventLoader: (day) {
+                      return taskState.tasks.where((task) {
+                        return isSameDay(task.dateTime, day);
+                      }).toList();
+                    },
+                    startingDayOfWeek: StartingDayOfWeek.monday,
+                    calendarStyle: const CalendarStyle(
+                      outsideDaysVisible: false,
+                    ),
+                    onDaySelected: (selectedDay, focusedDay) {
+                      if (!isSameDay(_selectedDay, selectedDay)) {
+                        setState(() {
+                          _selectedDay = selectedDay;
+                          _focusedDay = focusedDay;
+                        });
+                      }
+                    },
+                    onFormatChanged: (format) {
+                      if (_calendarFormat != format) {
+                        setState(() {
+                          _calendarFormat = format;
+                        });
+                      }
+                    },
+                    onPageChanged: (focusedDay) {
+                      _focusedDay = focusedDay;
+                    },
+                    selectedDayPredicate: (day) {
+                      return isSameDay(_selectedDay, day);
+                    },
+                  ),
+                  const SizedBox(height: 8.0),
+                  Expanded(
+                    child:
+                        _selectedDay == null
+                            ? const Center(
+                              child: Text('Select a day to view tasks'),
+                            )
+                            : _buildTaskList(taskState),
+                  ),
+                ],
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildTaskList(TaskState taskState) {
+    final tasksForDay =
+        taskState.tasks.where((task) {
+          return isSameDay(task.dateTime, _selectedDay!);
+        }).toList();
+
+    if (tasksForDay.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text(
+              'No tasks for ${DateFormat('MMM d, y').format(_selectedDay!)}',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed:
+                  () => Navigator.pushNamed(context, TaskEditorScreen.route),
+              icon: const Icon(Icons.add),
+              label: const Text('Add Task'),
+            ),
+          ],
+        ),
+      );
     }
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Pick Location'),
-        actions: [
-          TextButton(
-            onPressed:
-                _selected == null
-                    ? null
-                    : () {
-                      final res = MapPickerResult(
-                        latitude: _selected!.latitude,
-                        longitude: _selected!.longitude,
-                        label:
-                            _labelCtrl.text.trim().isEmpty
-                                ? null
-                                : _labelCtrl.text.trim(),
-                      );
-                      Navigator.pop(context, res);
-                    },
-            child: const Text('Save'),
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          Expanded(
-            child: GoogleMap(
-              initialCameraPosition: CameraPosition(target: initial, zoom: 14),
-              myLocationEnabled: false,
-              onMapCreated: (c) => _controller = c,
-              onTap: (pos) => setState(() => _selected = pos),
-              markers: {
-                if (_selected != null)
-                  Marker(
-                    markerId: const MarkerId('selected'),
-                    position: _selected!,
+    return ListView.builder(
+      itemCount: tasksForDay.length,
+      itemBuilder: (context, index) {
+        final task = tasksForDay[index];
+        final timeStr = DateFormat('h:mm a').format(task.dateTime);
+
+        return Card(
+          margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+          child: ListTile(
+            onTap:
+                () => Navigator.pushNamed(
+                  context,
+                  TaskEditorScreen.route,
+                  arguments: task,
+                ),
+            leading: Checkbox(
+              value: task.isCompleted,
+              onChanged: (bool? value) {
+                final willComplete = !task.isCompleted;
+                taskState.toggleTaskCompletion(task.id);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(
+                      willComplete
+                          ? 'Marked "${task.name}" as completed'
+                          : 'Marked "${task.name}" as incomplete',
+                    ),
+                    backgroundColor:
+                        willComplete ? Colors.green : Colors.orange,
+                    duration: const Duration(seconds: 2),
                   ),
+                );
+              },
+            ),
+            title: Text(
+              task.name,
+              style: TextStyle(
+                decoration:
+                    task.isCompleted
+                        ? TextDecoration.lineThrough
+                        : TextDecoration.none,
+                color: task.isCompleted ? Colors.grey : null,
+              ),
+            ),
+            subtitle: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  timeStr,
+                  style: TextStyle(
+                    color: task.isCompleted ? Colors.grey : null,
+                  ),
+                ),
+                if (task.description != null && task.description!.isNotEmpty)
+                  Text(
+                    task.description!,
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: task.isCompleted ? Colors.grey : null,
+                    ),
+                  ),
+              ],
+            ),
+            trailing: IconButton(
+              icon: const Icon(Icons.delete, color: Colors.red),
+              onPressed: () async {
+                final confirm = await showDialog<bool>(
+                  context: context,
+                  builder:
+                      (context) => AlertDialog(
+                        title: const Text('Delete Task'),
+                        content: Text('Delete "${task.name}"?'),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(context, false),
+                            child: const Text('Cancel'),
+                          ),
+                          FilledButton(
+                            onPressed: () => Navigator.pop(context, true),
+                            child: const Text('Delete'),
+                          ),
+                        ],
+                      ),
+                );
+                if (confirm == true) {
+                  taskState.delete(task.id);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('Deleted "${task.name}"'),
+                      backgroundColor: Colors.red,
+                      duration: const Duration(seconds: 2),
+                    ),
+                  );
+                }
               },
             ),
           ),
-          Padding(
-            padding: const EdgeInsets.all(12),
-            child: TextField(
-              controller: _labelCtrl,
-              decoration: const InputDecoration(
-                labelText: 'Location label (optional)',
-                border: OutlineInputBorder(),
-              ),
+        );
+      },
+    );
+  }
+}
+
+// Profile/Settings screen for account management
+class ProfileScreen extends StatelessWidget {
+  const ProfileScreen({super.key});
+  static const route = '/profile';
+
+  @override
+  Widget build(BuildContext context) {
+    return Consumer<AuthState>(
+      builder: (context, auth, _) {
+        return Scaffold(
+          appBar: AppBar(title: const Text('Profile & Settings')),
+          body: Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16.0),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Account Information',
+                          style: Theme.of(context).textTheme.titleLarge,
+                        ),
+                        const SizedBox(height: 16),
+                        ListTile(
+                          leading: const Icon(Icons.person, color: Colors.grey),
+                          title: const Text('Username'),
+                          subtitle: Text(auth.username ?? 'Not set'),
+                          trailing: IconButton(
+                            icon: const Icon(Icons.edit),
+                            onPressed:
+                                () => _showEditUsernameDialog(context, auth),
+                          ),
+                        ),
+                        const Divider(),
+                        ListTile(
+                          leading: const Icon(Icons.email, color: Colors.grey),
+                          title: const Text('Email'),
+                          subtitle: Text(auth.email ?? 'Not set'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 24),
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16.0),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Account Actions',
+                          style: Theme.of(context).textTheme.titleLarge,
+                        ),
+                        const SizedBox(height: 16),
+                        ListTile(
+                          leading: const Icon(
+                            Icons.logout,
+                            color: Colors.orange,
+                          ),
+                          title: const Text('Logout'),
+                          subtitle: const Text('Sign out of your account'),
+                          onTap: () {
+                            auth.logout();
+                            Navigator.pop(context);
+                          },
+                        ),
+                        const Divider(),
+                        ListTile(
+                          leading: const Icon(
+                            Icons.delete_forever,
+                            color: Colors.red,
+                          ),
+                          title: const Text(
+                            'Delete Account',
+                            style: TextStyle(color: Colors.red),
+                          ),
+                          subtitle: const Text(
+                            'Permanently delete your account and all data',
+                          ),
+                          onTap: () => _showDeleteAccountDialog(context, auth),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
-        ],
-      ),
+        );
+      },
+    );
+  }
+
+  void _showEditUsernameDialog(BuildContext context, AuthState auth) {
+    final TextEditingController usernameController = TextEditingController();
+    usernameController.text = auth.username ?? '';
+
+    showDialog(
+      context: context,
+      builder:
+          (context) => AlertDialog(
+            title: const Text('Edit Username'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: usernameController,
+                  decoration: const InputDecoration(
+                    labelText: 'Username',
+                    hintText: 'Enter new username',
+                  ),
+                  autofocus: true,
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Username must be at least 3 characters long',
+                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  usernameController.dispose();
+                  Navigator.pop(context);
+                },
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () async {
+                  final newUsername = usernameController.text.trim();
+                  if (newUsername.length < 3) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Username must be at least 3 characters'),
+                        backgroundColor: Colors.red,
+                      ),
+                    );
+                    return;
+                  }
+
+                  Navigator.pop(context); // Close dialog first
+
+                  // Show loading
+                  showDialog(
+                    context: context,
+                    barrierDismissible: false,
+                    builder:
+                        (context) => const AlertDialog(
+                          content: Row(
+                            children: [
+                              CircularProgressIndicator(),
+                              SizedBox(width: 16),
+                              Text('Updating username...'),
+                            ],
+                          ),
+                        ),
+                  );
+
+                  try {
+                    final error = await auth.updateUsername(newUsername);
+                    usernameController.dispose();
+
+                    if (context.mounted) {
+                      Navigator.pop(context); // Close loading dialog
+
+                      if (error != null) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text(error),
+                            backgroundColor: Colors.red,
+                          ),
+                        );
+                      } else {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('Username updated successfully!'),
+                            backgroundColor: Colors.green,
+                          ),
+                        );
+                      }
+                    }
+                  } catch (e) {
+                    usernameController.dispose();
+                    if (context.mounted) {
+                      Navigator.pop(context); // Close loading dialog
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text('Error: ${e.toString()}'),
+                          backgroundColor: Colors.red,
+                        ),
+                      );
+                    }
+                  }
+                },
+                child: const Text('Update'),
+              ),
+            ],
+          ),
+    );
+  }
+
+  void _showDeleteAccountDialog(BuildContext context, AuthState auth) {
+    showDialog(
+      context: context,
+      builder:
+          (context) => AlertDialog(
+            title: const Text('Delete Account'),
+            content: const Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Are you sure you want to delete your account?'),
+                SizedBox(height: 8),
+                Text(
+                  '⚠️ This action cannot be undone. All your tasks and data will be permanently deleted.',
+                  style: TextStyle(color: Colors.red, fontSize: 12),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                style: FilledButton.styleFrom(
+                  backgroundColor: Colors.red,
+                  foregroundColor: Colors.white,
+                ),
+                onPressed: () async {
+                  Navigator.pop(context); // Close dialog first
+
+                  // Show loading
+                  showDialog(
+                    context: context,
+                    barrierDismissible: false,
+                    builder:
+                        (context) => const AlertDialog(
+                          content: Row(
+                            children: [
+                              CircularProgressIndicator(),
+                              SizedBox(width: 16),
+                              Text('Deleting account...'),
+                            ],
+                          ),
+                        ),
+                  );
+
+                  try {
+                    final error = await auth.deleteAccount();
+
+                    if (context.mounted) {
+                      Navigator.pop(context); // Close loading dialog
+
+                      if (error != null) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text(error),
+                            backgroundColor: Colors.red,
+                          ),
+                        );
+                      } else {
+                        // Account deleted successfully, navigate to login
+                        Navigator.of(
+                          context,
+                        ).popUntil((route) => route.isFirst);
+                      }
+                    }
+                  } catch (e) {
+                    if (context.mounted) {
+                      Navigator.pop(context); // Close loading dialog
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text('Error: ${e.toString()}'),
+                          backgroundColor: Colors.red,
+                        ),
+                      );
+                    }
+                  }
+                },
+                child: const Text('Delete Account'),
+              ),
+            ],
+          ),
     );
   }
 }
